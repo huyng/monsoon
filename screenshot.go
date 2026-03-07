@@ -66,6 +66,8 @@ import (
 	"image/png"
 	"os"
 	"unsafe"
+
+	"github.com/disintegration/imaging"
 )
 
 // Screenshot represents a captured image
@@ -117,7 +119,8 @@ func (s *Screenshot) SaveJPEG(filename string) error {
 	}
 	defer file.Close()
 	img := s.ToImage()
-	return jpeg.Encode(file, img, &jpeg.Options{Quality: 40})
+	dst := imaging.Resize(img, 1024, 0, imaging.Lanczos)
+	return jpeg.Encode(file, dst, &jpeg.Options{Quality: 40})
 }
 
 // Capture takes a screenshot of the entire screen
