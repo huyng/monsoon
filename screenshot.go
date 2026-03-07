@@ -119,7 +119,7 @@ func (s *Screenshot) SaveJPEG(filename string) error {
 	}
 	defer file.Close()
 	img := s.ToImage()
-	dst := imaging.Resize(img, 1024, 0, imaging.Lanczos)
+	dst := imaging.Resize(img, 800, 0, imaging.Lanczos)
 	return jpeg.Encode(file, dst, &jpeg.Options{Quality: 40})
 }
 
