@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 const indexHTML = `<!DOCTYPE html>
@@ -137,13 +138,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startFFmpeg(display string, fps int) (*exec.Cmd, io.ReadCloser) {
+func startFFmpeg(width, height, fps int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
 	fpsStr := fmt.Sprintf("%d", fps)
 	cmd := exec.Command("ffmpeg",
-		"-f", "x11grab",
+		"-f", "rawvideo",
+		"-pixel_format", "rgb24",
+		"-video_size", fmt.Sprintf("%dx%d", width, height),
 		"-r", fpsStr,
-		"-i", display,
+		"-i", "pipe:0",
 		"-vcodec", "libx264",
+		"-profile:v", "baseline",
+		"-level", "3.0",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
 		"-pix_fmt", "yuv420p",
@@ -153,6 +158,10 @@ func startFFmpeg(display string, fps int) (*exec.Cmd, io.ReadCloser) {
 		"pipe:1",
 	)
 	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Fatalf("ffmpeg stdin pipe: %v", err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Fatalf("ffmpeg stdout pipe: %v", err)
@@ -160,7 +169,7 @@ func startFFmpeg(display string, fps int) (*exec.Cmd, io.ReadCloser) {
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("ffmpeg start: %v", err)
 	}
-	return cmd, stdout
+	return cmd, stdin, stdout
 }
 
 // readInitSegment reads fMP4 boxes until the first moof box, returning the
@@ -191,7 +200,34 @@ func main() {
 	broadcaster = newBroadcaster()
 	go broadcaster.run()
 
-	ffmpegCmd, stdout := startFFmpeg(display, fps)
+	// Take one screenshot to get screen dimensions before starting ffmpeg.
+	firstShot, err := Capture(display)
+	if err != nil {
+		log.Fatalf("initial capture failed: %v", err)
+	}
+	log.Printf("screen size: %dx%d", firstShot.Width, firstShot.Height)
+
+	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(firstShot.Width, firstShot.Height, fps)
+
+	// Feed the first frame immediately, then continue at the target rate.
+	ffmpegStdin.Write(firstShot.Data)
+
+	// Capture loop: write raw RGB frames to ffmpeg stdin.
+	go func() {
+		ticker := time.NewTicker(time.Second / time.Duration(fps))
+		defer ticker.Stop()
+		for range ticker.C {
+			shot, err := Capture(display)
+			if err != nil {
+				log.Printf("capture error: %v", err)
+				continue
+			}
+			if _, err := ffmpegStdin.Write(shot.Data); err != nil {
+				log.Printf("ffmpeg stdin closed: %v", err)
+				return
+			}
+		}
+	}()
 
 	// Read boxes until we get the init segment (ftyp+moov).
 	// The first moof box marks the start of media data.
@@ -201,24 +237,25 @@ func main() {
 
 	// Read and broadcast complete moof+mdat fragment pairs.
 	go func() {
-		// Handle the first moof we already read.
 		pendingMoof := firstMoof
 		for {
-			mdat, err := readBox(stdout)
+			box, err := readBox(stdout)
 			if err != nil {
 				log.Printf("ffmpeg stdout closed: %v", err)
 				return
 			}
-			fragment := make([]byte, len(pendingMoof)+len(mdat))
-			copy(fragment, pendingMoof)
-			copy(fragment[len(pendingMoof):], mdat)
-			broadcaster.publish <- fragment
-
-			// Read next moof.
-			pendingMoof, err = readBox(stdout)
-			if err != nil {
-				log.Printf("ffmpeg stdout closed: %v", err)
-				return
+			boxType := string(box[4:8])
+			switch boxType {
+			case "mdat":
+				fragment := make([]byte, len(pendingMoof)+len(box))
+				copy(fragment, pendingMoof)
+				copy(fragment[len(pendingMoof):], box)
+				broadcaster.publish <- fragment
+				pendingMoof = nil
+			case "moof":
+				pendingMoof = box
+			default:
+				log.Printf("skipping unexpected box type: %s (%d bytes)", boxType, len(box))
 			}
 		}
 	}()
