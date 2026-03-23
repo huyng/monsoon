@@ -6,6 +6,7 @@ package main
 #include <X11/Xutil.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 int get_screen(Display* dpy) {
     return DefaultScreen(dpy);
