@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 const indexHTML = `<!DOCTYPE html>
@@ -228,10 +227,10 @@ func main() {
 	ffmpegStdin.Write(firstShot.Data)
 
 	// Capture loop: write raw BGRX frames to ffmpeg stdin.
+	// No ticker needed — ffmpeg's stdin pipe provides natural backpressure;
+	// Write blocks when ffmpeg can't consume fast enough, self-pacing the loop.
 	go func() {
-		ticker := time.NewTicker(time.Second / time.Duration(fps))
-		defer ticker.Stop()
-		for range ticker.C {
+		for {
 			shot, err := Capture(display)
 			if err != nil {
 				log.Printf("capture error: %v", err)
