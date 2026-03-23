@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -26,12 +27,15 @@ ms.addEventListener('sourceopen', () => {
     const reader = r.body.getReader();
     const pump = () => reader.read().then(({done, value}) => {
       if (done) return;
-      if (sb.updating) {
-        sb.addEventListener('updateend', () => sb.appendBuffer(value), {once: true});
-      } else {
-        sb.appendBuffer(value);
-      }
-      pump();
+      const append = () => {
+        if (sb.updating) {
+          sb.addEventListener('updateend', append, {once: true});
+        } else {
+          sb.appendBuffer(value);
+          pump();
+        }
+      };
+      append();
     });
     pump();
   });
@@ -40,7 +44,7 @@ ms.addEventListener('sourceopen', () => {
 </body>
 </html>`
 
-// Broadcaster fans out fMP4 chunks from ffmpeg to all connected HTTP clients.
+// Broadcaster fans out fMP4 fragments from ffmpeg to all connected HTTP clients.
 type Broadcaster struct {
 	initSegment []byte
 	clients     map[chan []byte]struct{}
@@ -76,6 +80,24 @@ func (b *Broadcaster) run() {
 			}
 		}
 	}
+}
+
+// readBox reads one complete MP4 box (header + payload) from r.
+func readBox(r io.Reader) ([]byte, error) {
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint32(header[:4])
+	if size < 8 {
+		return nil, fmt.Errorf("invalid box size %d", size)
+	}
+	box := make([]byte, size)
+	copy(box, header)
+	if _, err := io.ReadFull(r, box[8:]); err != nil {
+		return nil, err
+	}
+	return box, nil
 }
 
 var broadcaster *Broadcaster
@@ -141,6 +163,22 @@ func startFFmpeg(display string, fps int) (*exec.Cmd, io.ReadCloser) {
 	return cmd, stdout
 }
 
+// readInitSegment reads fMP4 boxes until the first moof box, returning the
+// accumulated init segment (ftyp+moov) and the first moof box separately.
+func readInitSegment(r io.Reader) (initSeg []byte, firstMoof []byte) {
+	for {
+		box, err := readBox(r)
+		if err != nil {
+			log.Fatalf("reading fMP4 box: %v", err)
+		}
+		boxType := string(box[4:8])
+		if boxType == "moof" {
+			return initSeg, box
+		}
+		initSeg = append(initSeg, box...)
+	}
+}
+
 func main() {
 	var display string
 	var port int
@@ -155,27 +193,29 @@ func main() {
 
 	ffmpegCmd, stdout := startFFmpeg(display, fps)
 
-	// Read the fMP4 init segment (first chunk before any moof boxes).
-	// With empty_moov, ffmpeg flushes the init segment as the first write.
-	initBuf := make([]byte, 32*1024)
-	n, err := stdout.Read(initBuf)
-	if err != nil {
-		log.Fatalf("reading ffmpeg init segment: %v", err)
-	}
-	broadcaster.initSegment = make([]byte, n)
-	copy(broadcaster.initSegment, initBuf[:n])
-	log.Printf("captured init segment: %d bytes", n)
+	// Read boxes until we get the init segment (ftyp+moov).
+	// The first moof box marks the start of media data.
+	initSeg, firstMoof := readInitSegment(stdout)
+	broadcaster.initSegment = initSeg
+	log.Printf("captured init segment: %d bytes", len(initSeg))
 
-	// Continuously read ffmpeg output and broadcast to clients.
+	// Read and broadcast complete moof+mdat fragment pairs.
 	go func() {
-		buf := make([]byte, 32*1024)
+		// Handle the first moof we already read.
+		pendingMoof := firstMoof
 		for {
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				broadcaster.publish <- chunk
+			mdat, err := readBox(stdout)
+			if err != nil {
+				log.Printf("ffmpeg stdout closed: %v", err)
+				return
 			}
+			fragment := make([]byte, len(pendingMoof)+len(mdat))
+			copy(fragment, pendingMoof)
+			copy(fragment[len(pendingMoof):], mdat)
+			broadcaster.publish <- fragment
+
+			// Read next moof.
+			pendingMoof, err = readBox(stdout)
 			if err != nil {
 				log.Printf("ffmpeg stdout closed: %v", err)
 				return
