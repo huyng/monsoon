@@ -15,7 +15,8 @@ Window get_root(Display* dpy, int screen_num) {
     return RootWindow(dpy, screen_num);
 }
 
-// capture_screenshot captures the X11 screen and returns a malloc'd RGB buffer.
+// capture_screenshot captures the X11 screen and returns a malloc'd copy of
+// the raw XImage pixel data (BGRX, 4 bytes/pixel).
 // width and height are set to the screen dimensions.
 // Caller must free the returned pointer.
 uint8_t* capture_screenshot(Display* display, int* width, int* height) {
@@ -30,21 +31,11 @@ uint8_t* capture_screenshot(Display* display, int* width, int* height) {
     XImage* img = XGetImage(display, root, 0, 0, attrs.width, attrs.height, AllPlanes, ZPixmap);
     if (!img) return NULL;
 
-    uint8_t* data = (uint8_t*)malloc(attrs.width * attrs.height * 3);
-    if (!data) {
-        XDestroyImage(img);
-        return NULL;
-    }
-
-    int idx = 0;
-    for (int y = 0; y < attrs.height; y++) {
-        for (int x = 0; x < attrs.width; x++) {
-            unsigned long pixel = XGetPixel(img, x, y);
-            data[idx++] = (pixel >> 16) & 0xFF; // R
-            data[idx++] = (pixel >>  8) & 0xFF; // G
-            data[idx++] =  pixel        & 0xFF; // B
-        }
-    }
+    // Copy raw pixel buffer directly — avoids per-pixel XGetPixel() calls.
+    // ZPixmap on Linux is BGRX (4 bytes/pixel); ffmpeg -pixel_format bgr0 matches this.
+    size_t size = (size_t)attrs.width * attrs.height * (img->bits_per_pixel / 8);
+    uint8_t* data = (uint8_t*)malloc(size);
+    if (data) memcpy(data, img->data, size);
 
     XDestroyImage(img);
     return data;

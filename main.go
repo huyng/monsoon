@@ -144,7 +144,7 @@ func startFFmpeg(width, height, fps, scaleWidth int) (*exec.Cmd, io.WriteCloser,
 	scaleFilter := fmt.Sprintf("scale=%d:-2", scaleWidth)
 	cmd := exec.Command("ffmpeg",
 		"-f", "rawvideo",
-		"-pixel_format", "rgb24",
+		"-pixel_format", "bgr0",
 		"-video_size", fmt.Sprintf("%dx%d", width, height),
 		"-r", fpsStr,
 		"-i", "pipe:0",
