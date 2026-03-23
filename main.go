@@ -138,14 +138,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startFFmpeg(width, height, fps int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
+func startFFmpeg(width, height, fps, scaleWidth int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
 	fpsStr := fmt.Sprintf("%d", fps)
+	// scale=W:-2 maintains aspect ratio; -2 ensures height is divisible by 2 (required for yuv420p)
+	scaleFilter := fmt.Sprintf("scale=%d:-2", scaleWidth)
 	cmd := exec.Command("ffmpeg",
 		"-f", "rawvideo",
 		"-pixel_format", "rgb24",
 		"-video_size", fmt.Sprintf("%dx%d", width, height),
 		"-r", fpsStr,
 		"-i", "pipe:0",
+		"-vf", scaleFilter,
 		"-vcodec", "libx264",
 		"-profile:v", "baseline",
 		"-level", "3.0",
@@ -192,9 +195,11 @@ func main() {
 	var display string
 	var port int
 	var fps int
+	var scaleWidth int
 	flag.StringVar(&display, "d", ":0.0", "X display to capture")
 	flag.IntVar(&port, "p", 8080, "HTTP port")
 	flag.IntVar(&fps, "r", 30, "Capture frame rate")
+	flag.IntVar(&scaleWidth, "w", 1280, "Output width in pixels (height scaled proportionally)")
 	flag.Parse()
 
 	broadcaster = newBroadcaster()
@@ -207,7 +212,7 @@ func main() {
 	}
 	log.Printf("screen size: %dx%d", firstShot.Width, firstShot.Height)
 
-	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(firstShot.Width, firstShot.Height, fps)
+	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(firstShot.Width, firstShot.Height, fps, scaleWidth)
 
 	// Feed the first frame immediately, then continue at the target rate.
 	ffmpegStdin.Write(firstShot.Data)
