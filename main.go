@@ -227,7 +227,13 @@ func main() {
 	// Feed the first frame immediately, then continue at the target rate.
 	ffmpegStdin.Write(firstShot.Data)
 
-	// Capture loop: write raw BGRX frames to ffmpeg stdin.
+	// frameCh decouples capture from ffmpeg encoding. Buffer of 1 means the
+	// capture loop always delivers the latest frame; if ffmpeg is busy (e.g.
+	// encoding a keyframe), the pending frame is replaced rather than queued,
+	// preventing pipeline backpressure from causing visible stutter.
+	frameCh := make(chan []byte, 1)
+
+	// Capture goroutine: runs at target FPS, drops frames when ffmpeg can't keep up.
 	go func() {
 		ticker := time.NewTicker(time.Second / time.Duration(fps))
 		defer ticker.Stop()
@@ -237,7 +243,17 @@ func main() {
 				log.Printf("capture error: %v", err)
 				continue
 			}
-			if _, err := ffmpegStdin.Write(shot.Data); err != nil {
+			select {
+			case frameCh <- shot.Data:
+			default: // ffmpeg busy, drop this frame
+			}
+		}
+	}()
+
+	// Writer goroutine: blocks on ffmpeg stdin without affecting the capture loop.
+	go func() {
+		for data := range frameCh {
+			if _, err := ffmpegStdin.Write(data); err != nil {
 				log.Printf("ffmpeg stdin closed: %v", err)
 				return
 			}
