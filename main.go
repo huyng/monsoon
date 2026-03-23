@@ -23,7 +23,14 @@ const indexHTML = `<!DOCTYPE html>
 const ms = new MediaSource();
 document.getElementById('v').src = URL.createObjectURL(ms);
 ms.addEventListener('sourceopen', () => {
-  const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+  // codec string format: avc1.PPCCLL
+  //   PP = profile: 42 = Baseline
+  //   CC = constraint flags: E0 = constrained baseline
+  //   LL = level in hex: 29 = 4.1 (supports 1080p@30fps, 720p@60fps)
+  // This MUST match the -profile:v and -level passed to ffmpeg.
+  // Using too low a level (e.g. 3.0 = 0x1E) causes the browser to reject
+  // the stream at higher frame rates or resolutions.
+  const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E029"');
   fetch('/stream').then(r => {
     const reader = r.body.getReader();
     const pump = () => reader.read().then(({done, value}) => {
@@ -151,7 +158,10 @@ func startFFmpeg(width, height, fps, scaleWidth int) (*exec.Cmd, io.WriteCloser,
 		"-vf", scaleFilter,
 		"-vcodec", "libx264",
 		"-profile:v", "baseline",
-		"-level", "3.0",
+		// Level 4.1 supports 1080p@30fps and 720p@60fps.
+		// Must match the avc1.42E0LL codec string in the HTML (LL=29 hex=4.1).
+		// Lower levels (e.g. 3.0) silently break the stream at non-default FPS.
+		"-level", "4.1",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
 		"-pix_fmt", "yuv420p",
