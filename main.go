@@ -7,11 +7,40 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
 
-var screenshotTempFile string
+// frameBuffer holds the latest JPEG frame in memory and uses a sync.Cond to
+// wake HTTP handlers the moment a new frame is ready, avoiding polling delays.
+type frameBuffer struct {
+	mu   sync.RWMutex
+	data []byte
+	cond *sync.Cond
+}
+
+func newFrameBuffer() *frameBuffer {
+	fb := &frameBuffer{}
+	fb.cond = sync.NewCond(&fb.mu)
+	return fb
+}
+
+func (fb *frameBuffer) store(data []byte) {
+	fb.mu.Lock()
+	fb.data = data
+	fb.mu.Unlock()
+	fb.cond.Broadcast() // wake all waiting HTTP handlers
+}
+
+func (fb *frameBuffer) wait() []byte {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.cond.Wait()
+	return fb.data
+}
+
+var frameBuf *frameBuffer
 
 func captureFrames(display string, intervalMSecs int, width int) {
 	for {
@@ -21,23 +50,16 @@ func captureFrames(display string, intervalMSecs int, width int) {
 			continue
 		}
 
-		imageFileTemp := screenshotTempFile + ".tmp"
-		err = screenshot.SaveJPEG(imageFileTemp, width)
+		jpeg, err := screenshot.ToJPEG(width)
 		if err != nil {
-			fmt.Printf("Failed to save: %v\n", err)
+			fmt.Printf("Failed to encode: %v\n", err)
 			continue
 		}
 
-		// Atomic rename so the HTTP handler never reads a partially written file.
-		os.Rename(imageFileTemp, screenshotTempFile)
+		frameBuf.store(jpeg)
 
 		time.Sleep(time.Millisecond * time.Duration(intervalMSecs))
 	}
-}
-
-func getFrame() []byte {
-	data, _ := os.ReadFile(screenshotTempFile)
-	return data
 }
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +67,8 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
 
 	for {
-		frame := getFrame()
+		// Block until a new frame is available rather than polling with a fixed sleep.
+		frame := frameBuf.wait()
 
 		_, err := fmt.Fprintf(w, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", boundary, len(frame))
 		if err != nil {
@@ -54,8 +77,6 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 		w.Write(frame)
 		fmt.Fprintf(w, "\r\n")
-
-		time.Sleep(33 * time.Millisecond)
 	}
 }
 
@@ -71,16 +92,10 @@ func main() {
 	fmt.Printf("Capturing DISPLAY=%s\n", display)
 	os.Setenv("DISPLAY", display)
 
-	tempfile, err := os.CreateTemp("", "monsoon-*.jpg")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer os.Remove(tempfile.Name())
-	defer os.Remove(tempfile.Name() + ".tmp")
-	defer tempfile.Close()
-	screenshotTempFile = tempfile.Name()
+	frameBuf = newFrameBuffer()
 
-	go captureFrames(display, 50, width)
+	// Capture at 30 FPS (~33ms), matching the rate clients receive frames.
+	go captureFrames(display, 33, width)
 
 	go func() {
 		http.HandleFunc("/stream", streamHandler)

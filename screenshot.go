@@ -44,10 +44,10 @@ uint8_t* capture_screenshot(Display* display, int* width, int* height) {
 */
 import "C"
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/jpeg"
-	"os"
 	"unsafe"
 
 	"github.com/disintegration/imaging"
@@ -104,16 +104,17 @@ func (s *Screenshot) ToImage() *image.RGBA {
 	return img
 }
 
-// SaveJPEG resizes the screenshot to the given width (preserving aspect ratio)
-// and saves it as a JPEG to filename.
-func (s *Screenshot) SaveJPEG(filename string, width int) error {
-	resized := imaging.Resize(s.ToImage(), width, 0, imaging.Lanczos)
+// ToJPEG resizes the screenshot to the given width (preserving aspect ratio)
+// and returns it encoded as a JPEG byte slice.
+// imaging.Linear is used instead of Lanczos — fast enough for screen content
+// with no visible quality difference for text/UI.
+// Quality 65 balances sharpness and bandwidth for screen sharing.
+func (s *Screenshot) ToJPEG(width int) ([]byte, error) {
+	resized := imaging.Resize(s.ToImage(), width, 0, imaging.Linear)
 
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 65}); err != nil {
+		return nil, err
 	}
-	defer f.Close()
-
-	return jpeg.Encode(f, resized, &jpeg.Options{Quality: 40})
+	return buf.Bytes(), nil
 }
