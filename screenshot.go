@@ -8,7 +8,6 @@ package main
 #include <stdint.h>
 #include <string.h>
 
-
 int get_screen(Display* dpy) {
     return DefaultScreen(dpy);
 }
@@ -34,7 +33,7 @@ uint8_t* capture_screenshot(Display* display, int* width, int* height) {
     if (!img) return NULL;
 
     // Copy raw pixel buffer directly — avoids per-pixel XGetPixel() calls.
-    // ZPixmap on Linux is BGRX (4 bytes/pixel); ffmpeg -pixel_format bgr0 matches this.
+    // ZPixmap on Linux is BGRX (4 bytes/pixel); see ToImage() for channel swap.
     size_t size = (size_t)attrs.width * attrs.height * (img->bits_per_pixel / 8);
     uint8_t* data = (uint8_t*)malloc(size);
     if (data) memcpy(data, img->data, size);
@@ -46,7 +45,12 @@ uint8_t* capture_screenshot(Display* display, int* width, int* height) {
 import "C"
 import (
 	"fmt"
+	"image"
+	"image/jpeg"
+	"os"
 	"unsafe"
+
+	"github.com/disintegration/imaging"
 )
 
 // Screenshot holds raw BGRX pixel data from the X11 display.
@@ -77,12 +81,39 @@ func Capture(display string) (*Screenshot, error) {
 	defer C.free(unsafe.Pointer(data))
 
 	size := int(width) * int(height) * 4 // BGRX: 4 bytes/pixel
-	rgb := make([]byte, size)
-	copy(rgb, C.GoBytes(unsafe.Pointer(data), C.int(size)))
+	buf := make([]byte, size)
+	copy(buf, C.GoBytes(unsafe.Pointer(data), C.int(size)))
 
 	return &Screenshot{
 		Width:  int(width),
 		Height: int(height),
-		Data:   rgb,
+		Data:   buf,
 	}, nil
+}
+
+// ToImage converts the raw BGRX pixel data to an image.RGBA,
+// swapping the B and R channels to match Go's RGBA layout.
+func (s *Screenshot) ToImage() *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, s.Width, s.Height))
+	for i := 0; i < s.Width*s.Height; i++ {
+		img.Pix[i*4+0] = s.Data[i*4+2] // R
+		img.Pix[i*4+1] = s.Data[i*4+1] // G
+		img.Pix[i*4+2] = s.Data[i*4+0] // B
+		img.Pix[i*4+3] = 255            // A
+	}
+	return img
+}
+
+// SaveJPEG resizes the screenshot to the given width (preserving aspect ratio)
+// and saves it as a JPEG to filename.
+func (s *Screenshot) SaveJPEG(filename string, width int) error {
+	resized := imaging.Resize(s.ToImage(), width, 0, imaging.Lanczos)
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return jpeg.Encode(f, resized, &jpeg.Options{Quality: 40})
 }

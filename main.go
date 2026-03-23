@@ -1,302 +1,91 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
 )
 
-const indexHTML = `<!DOCTYPE html>
-<html>
-<head><title>monsoon</title></head>
-<body style="margin:0;background:#000">
-<video id="v" autoplay muted controls style="width:100%;height:100vh"></video>
-<script>
-const ms = new MediaSource();
-document.getElementById('v').src = URL.createObjectURL(ms);
-ms.addEventListener('sourceopen', () => {
-  // codec string format: avc1.PPCCLL
-  //   PP = profile: 42 = Baseline
-  //   CC = constraint flags: E0 = constrained baseline
-  //   LL = level in hex: 29 = 4.1 (supports 1080p@30fps, 720p@60fps)
-  // This MUST match the -profile:v and -level passed to ffmpeg.
-  // Using too low a level (e.g. 3.0 = 0x1E) causes the browser to reject
-  // the stream at higher frame rates or resolutions.
-  const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E029"');
-  fetch('/stream').then(r => {
-    const reader = r.body.getReader();
-    const pump = () => reader.read().then(({done, value}) => {
-      if (done) return;
-      const append = () => {
-        if (sb.updating) {
-          sb.addEventListener('updateend', append, {once: true});
-        } else {
-          sb.appendBuffer(value);
-          pump();
-        }
-      };
-      append();
-    });
-    pump();
-  });
-});
-</script>
-</body>
-</html>`
+var screenshotTempFile string
 
-// Broadcaster fans out fMP4 fragments from ffmpeg to all connected HTTP clients.
-type Broadcaster struct {
-	initSegment []byte
-	clients     map[chan []byte]struct{}
-	register    chan chan []byte
-	unregister  chan chan []byte
-	publish     chan []byte
-}
-
-func newBroadcaster() *Broadcaster {
-	return &Broadcaster{
-		clients:    make(map[chan []byte]struct{}),
-		register:   make(chan chan []byte),
-		unregister: make(chan chan []byte),
-		publish:    make(chan []byte, 8),
-	}
-}
-
-func (b *Broadcaster) run() {
+func captureFrames(display string, intervalMSecs int, width int) {
 	for {
-		select {
-		case ch := <-b.register:
-			b.clients[ch] = struct{}{}
-		case ch := <-b.unregister:
-			delete(b.clients, ch)
-			close(ch)
-		case chunk := <-b.publish:
-			for ch := range b.clients {
-				select {
-				case ch <- chunk:
-				default:
-					// slow client: drop the chunk rather than blocking
-				}
-			}
+		screenshot, err := Capture(display)
+		if err != nil {
+			fmt.Printf("Failed to capture: %v\n", err)
+			continue
 		}
+
+		imageFileTemp := screenshotTempFile + ".tmp"
+		err = screenshot.SaveJPEG(imageFileTemp, width)
+		if err != nil {
+			fmt.Printf("Failed to save: %v\n", err)
+			continue
+		}
+
+		// Atomic rename so the HTTP handler never reads a partially written file.
+		os.Rename(imageFileTemp, screenshotTempFile)
+
+		time.Sleep(time.Millisecond * time.Duration(intervalMSecs))
 	}
 }
 
-// readBox reads one complete MP4 box (header + payload) from r.
-func readBox(r io.Reader) ([]byte, error) {
-	header := make([]byte, 8)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
-	}
-	size := binary.BigEndian.Uint32(header[:4])
-	if size < 8 {
-		return nil, fmt.Errorf("invalid box size %d", size)
-	}
-	box := make([]byte, size)
-	copy(box, header)
-	if _, err := io.ReadFull(r, box[8:]); err != nil {
-		return nil, err
-	}
-	return box, nil
-}
-
-var broadcaster *Broadcaster
-
-func serveIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(indexHTML))
+func getFrame() []byte {
+	data, _ := os.ReadFile(screenshotTempFile)
+	return data
 }
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
-	ch := make(chan []byte, 4)
-	broadcaster.register <- ch
-	defer func() { broadcaster.unregister <- ch }()
-
-	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	// Send the fMP4 init segment so the client can start decoding immediately.
-	if _, err := w.Write(broadcaster.initSegment); err != nil {
-		return
-	}
-	w.(http.Flusher).Flush()
+	boundary := "frameBoundary"
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
 
 	for {
-		select {
-		case chunk, ok := <-ch:
-			if !ok {
-				return
-			}
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-			w.(http.Flusher).Flush()
-		case <-r.Context().Done():
-			return
-		}
-	}
-}
+		frame := getFrame()
 
-func startFFmpeg(width, height, fps, scaleWidth int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
-	fpsStr := fmt.Sprintf("%d", fps)
-	// scale=W:-2 maintains aspect ratio; -2 ensures height is divisible by 2 (required for yuv420p)
-	scaleFilter := fmt.Sprintf("scale=%d:-2", scaleWidth)
-	cmd := exec.Command("ffmpeg",
-		"-f", "rawvideo",
-		"-pixel_format", "bgr0",
-		"-video_size", fmt.Sprintf("%dx%d", width, height),
-		"-r", fpsStr,
-		"-i", "pipe:0",
-		"-vf", scaleFilter,
-		"-vcodec", "libx264",
-		"-profile:v", "baseline",
-		// Level 4.1 supports 1080p@30fps and 720p@60fps.
-		// Must match the avc1.42E0LL codec string in the HTML (LL=29 hex=4.1).
-		// Lower levels (e.g. 3.0) silently break the stream at non-default FPS.
-		"-level", "4.1",
-		"-preset", "ultrafast",
-		"-tune", "zerolatency",
-		"-pix_fmt", "yuv420p",
-		"-g", fpsStr,
-		"-f", "mp4",
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
-		"pipe:1",
-	)
-	cmd.Stderr = os.Stderr
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		log.Fatalf("ffmpeg stdin pipe: %v", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Fatalf("ffmpeg stdout pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("ffmpeg start: %v", err)
-	}
-	return cmd, stdin, stdout
-}
-
-// readInitSegment reads fMP4 boxes until the first moof box, returning the
-// accumulated init segment (ftyp+moov) and the first moof box separately.
-func readInitSegment(r io.Reader) (initSeg []byte, firstMoof []byte) {
-	for {
-		box, err := readBox(r)
+		_, err := fmt.Fprintf(w, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", boundary, len(frame))
 		if err != nil {
-			log.Fatalf("reading fMP4 box: %v", err)
+			return // client disconnected
 		}
-		boxType := string(box[4:8])
-		if boxType == "moof" {
-			return initSeg, box
-		}
-		initSeg = append(initSeg, box...)
+
+		w.Write(frame)
+		fmt.Fprintf(w, "\r\n")
+
+		time.Sleep(33 * time.Millisecond)
 	}
 }
 
 func main() {
 	var display string
 	var port int
-	var fps int
-	var scaleWidth int
+	var width int
 	flag.StringVar(&display, "d", ":0.0", "X display to capture")
 	flag.IntVar(&port, "p", 8080, "HTTP port")
-	flag.IntVar(&fps, "r", 30, "Capture frame rate")
-	flag.IntVar(&scaleWidth, "w", 1280, "Output width in pixels (height scaled proportionally)")
+	flag.IntVar(&width, "w", 1280, "Output width in pixels (height scaled proportionally)")
 	flag.Parse()
 
-	broadcaster = newBroadcaster()
-	go broadcaster.run()
+	fmt.Printf("Capturing DISPLAY=%s\n", display)
+	os.Setenv("DISPLAY", display)
 
-	// Take one screenshot to get screen dimensions before starting ffmpeg.
-	firstShot, err := Capture(display)
+	tempfile, err := os.CreateTemp("", "monsoon-*.jpg")
 	if err != nil {
-		log.Fatalf("initial capture failed: %v", err)
+		log.Fatal(err)
 	}
-	log.Printf("screen size: %dx%d", firstShot.Width, firstShot.Height)
+	defer os.Remove(tempfile.Name())
+	defer os.Remove(tempfile.Name() + ".tmp")
+	defer tempfile.Close()
+	screenshotTempFile = tempfile.Name()
 
-	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(firstShot.Width, firstShot.Height, fps, scaleWidth)
-
-	// Feed the first frame immediately, then continue at the target rate.
-	ffmpegStdin.Write(firstShot.Data)
-
-	// frameCh decouples capture from ffmpeg encoding. Buffer of 1 means the
-	// capture loop always delivers the latest frame; if ffmpeg is busy (e.g.
-	// encoding a keyframe), the pending frame is replaced rather than queued,
-	// preventing pipeline backpressure from causing visible stutter.
-	frameCh := make(chan []byte, 1)
-
-	// Capture goroutine: runs at target FPS, drops frames when ffmpeg can't keep up.
-	go func() {
-		ticker := time.NewTicker(time.Second / time.Duration(fps))
-		defer ticker.Stop()
-		for range ticker.C {
-			shot, err := Capture(display)
-			if err != nil {
-				log.Printf("capture error: %v", err)
-				continue
-			}
-			select {
-			case frameCh <- shot.Data:
-			default: // ffmpeg busy, drop this frame
-			}
-		}
-	}()
-
-	// Writer goroutine: blocks on ffmpeg stdin without affecting the capture loop.
-	go func() {
-		for data := range frameCh {
-			if _, err := ffmpegStdin.Write(data); err != nil {
-				log.Printf("ffmpeg stdin closed: %v", err)
-				return
-			}
-		}
-	}()
-
-	// Read boxes until we get the init segment (ftyp+moov).
-	// The first moof box marks the start of media data.
-	initSeg, firstMoof := readInitSegment(stdout)
-	broadcaster.initSegment = initSeg
-	log.Printf("captured init segment: %d bytes", len(initSeg))
-
-	// Read and broadcast complete moof+mdat fragment pairs.
-	go func() {
-		pendingMoof := firstMoof
-		for {
-			box, err := readBox(stdout)
-			if err != nil {
-				log.Printf("ffmpeg stdout closed: %v", err)
-				return
-			}
-			boxType := string(box[4:8])
-			switch boxType {
-			case "mdat":
-				fragment := make([]byte, len(pendingMoof)+len(box))
-				copy(fragment, pendingMoof)
-				copy(fragment[len(pendingMoof):], box)
-				broadcaster.publish <- fragment
-				pendingMoof = nil
-			case "moof":
-				pendingMoof = box
-			default:
-				log.Printf("skipping unexpected box type: %s (%d bytes)", boxType, len(box))
-			}
-		}
-	}()
-
-	http.HandleFunc("/", serveIndex)
-	http.HandleFunc("/stream", streamHandler)
+	go captureFrames(display, 50, width)
 
 	go func() {
+		http.HandleFunc("/stream", streamHandler)
 		addr := fmt.Sprintf(":%d", port)
-		log.Printf("serving on http://localhost%s (display=%s, fps=%d)", addr, display, fps)
+		fmt.Printf("Server starting on http://localhost%s/stream\n", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Fatal(err)
 		}
@@ -305,6 +94,5 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	log.Println("shutting down...")
-	ffmpegCmd.Process.Kill()
+	fmt.Println("Received signal, shutting down...")
 }
