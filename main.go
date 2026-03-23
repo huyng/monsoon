@@ -145,14 +145,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startFFmpeg(width, height, fps int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
+func startFFmpeg(width, height, fps, scaleWidth int) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
 	fpsStr := fmt.Sprintf("%d", fps)
+	// scale=W:-2 maintains aspect ratio; -2 ensures height is divisible by 2 (required for yuv420p)
+	scaleFilter := fmt.Sprintf("scale=%d:-2", scaleWidth)
 	cmd := exec.Command("ffmpeg",
 		"-f", "rawvideo",
 		"-pixel_format", "bgr0",
 		"-video_size", fmt.Sprintf("%dx%d", width, height),
 		"-r", fpsStr,
 		"-i", "pipe:0",
+		"-vf", scaleFilter,
 		"-vcodec", "libx264",
 		"-profile:v", "baseline",
 		// Level 4.1 supports 1080p@30fps and 720p@60fps.
@@ -212,23 +215,19 @@ func main() {
 	broadcaster = newBroadcaster()
 	go broadcaster.run()
 
-	// Take one screenshot to determine source dimensions, then compute the
-	// resized dimensions to pass to ffmpeg before it starts.
+	// Take one screenshot to get screen dimensions before starting ffmpeg.
 	firstShot, err := Capture(display)
 	if err != nil {
 		log.Fatalf("initial capture failed: %v", err)
 	}
 	log.Printf("screen size: %dx%d", firstShot.Width, firstShot.Height)
 
-	firstResized, dstW, dstH := ResizeBGRX(firstShot.Data, firstShot.Width, firstShot.Height, scaleWidth)
-	log.Printf("output size: %dx%d", dstW, dstH)
-
-	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(dstW, dstH, fps)
+	ffmpegCmd, ffmpegStdin, stdout := startFFmpeg(firstShot.Width, firstShot.Height, fps, scaleWidth)
 
 	// Feed the first frame immediately, then continue at the target rate.
-	ffmpegStdin.Write(firstResized)
+	ffmpegStdin.Write(firstShot.Data)
 
-	// Capture loop: resize each frame in Go then write BGRX pixels to ffmpeg stdin.
+	// Capture loop: write raw BGRX frames to ffmpeg stdin.
 	go func() {
 		ticker := time.NewTicker(time.Second / time.Duration(fps))
 		defer ticker.Stop()
@@ -238,8 +237,7 @@ func main() {
 				log.Printf("capture error: %v", err)
 				continue
 			}
-			resized, _, _ := ResizeBGRX(shot.Data, shot.Width, shot.Height, scaleWidth)
-			if _, err := ffmpegStdin.Write(resized); err != nil {
+			if _, err := ffmpegStdin.Write(shot.Data); err != nil {
 				log.Printf("ffmpeg stdin closed: %v", err)
 				return
 			}

@@ -46,11 +46,7 @@ uint8_t* capture_screenshot(Display* display, int* width, int* height) {
 import "C"
 import (
 	"fmt"
-	"image"
-	"image/color"
 	"unsafe"
-
-	"golang.org/x/image/draw"
 )
 
 // Screenshot holds raw BGRX pixel data from the X11 display.
@@ -60,46 +56,6 @@ type Screenshot struct {
 	Width  int
 	Height int
 	Data   []byte // BGRX: 4 bytes/pixel, row-major
-}
-
-// bgrxImage wraps a raw BGRX byte slice as an image.Image so it can be
-// passed to golang.org/x/image/draw scalers without an extra copy.
-type bgrxImage struct {
-	data          []byte
-	width, height int
-}
-
-func (img *bgrxImage) ColorModel() color.Model { return color.NRGBAModel }
-func (img *bgrxImage) Bounds() image.Rectangle { return image.Rect(0, 0, img.width, img.height) }
-func (img *bgrxImage) At(x, y int) color.Color {
-	i := (y*img.width + x) * 4
-	return color.NRGBA{R: img.data[i+2], G: img.data[i+1], B: img.data[i+0], A: 255}
-}
-
-// ResizeBGRX scales raw BGRX pixel data to the given target width, preserving
-// aspect ratio. The output height is rounded up to the nearest even number
-// (required by ffmpeg's yuv420p pixel format). Returns resized BGRX bytes
-// and the new width and height.
-func ResizeBGRX(data []byte, srcW, srcH, dstW int) ([]byte, int, int) {
-	dstH := srcH * dstW / srcW
-	if dstH%2 != 0 {
-		dstH++
-	}
-
-	src := &bgrxImage{data: data, width: srcW, height: srcH}
-	dst := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
-	// BiLinear gives good quality at low cost; use draw.CatmullRom for sharper output.
-	draw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, nil)
-
-	// Convert image.NRGBA (RGBA order) back to BGRX byte layout.
-	out := make([]byte, dstW*dstH*4)
-	for i := 0; i < dstW*dstH; i++ {
-		out[i*4+0] = dst.Pix[i*4+2] // B
-		out[i*4+1] = dst.Pix[i*4+1] // G
-		out[i*4+2] = dst.Pix[i*4+0] // R
-		out[i*4+3] = 0               // X (padding)
-	}
-	return out, dstW, dstH
 }
 
 // Capture takes a screenshot from the given X display (e.g. ":0.0").
