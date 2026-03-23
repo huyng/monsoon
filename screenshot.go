@@ -72,7 +72,7 @@ func Capture(display string) (*Screenshot, error) {
 	}
 	defer C.free(unsafe.Pointer(data))
 
-	size := int(width) * int(height) * 3
+	size := int(width) * int(height) * 4 // BGRX: 4 bytes/pixel
 	rgb := make([]byte, size)
 	copy(rgb, C.GoBytes(unsafe.Pointer(data), C.int(size)))
 
