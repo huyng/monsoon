@@ -74,23 +74,45 @@
     const ctx = canvas.getContext('2d', {alpha: false});
 
     // Chain renders so frames are always applied in order and canvas writes
-    // never race. If a frame takes longer than the interval to decode, the
-    // next frame waits rather than overlapping — newest data always wins
-    // because the server drops frames for slow clients at the source.
+    // never race. Newest data always wins because the server drops frames for
+    // slow clients at the source.
     let renderQueue = Promise.resolve();
 
-    function connect() {
-      const ws = new WebSocket(`ws://${location.host}/ws`);
-      ws.binaryType = 'arraybuffer';
+    // connect opens a fetch stream and reads length-prefixed binary frames.
+    // Each frame is [4-byte LE length][payload]. On any error it reconnects.
+    async function connect() {
+      try {
+        const res = await fetch('/stream');
+        const reader = res.body.getReader();
+        let buf = new Uint8Array(0);
 
-      ws.onmessage = (event) => {
-        const buf = event.data;
-        renderQueue = renderQueue
-          .then(() => applyFrame(buf))
-          .catch(() => {});
-      };
+        // readExactly accumulates chunks from the reader until it has n bytes,
+        // then returns exactly n bytes and keeps the remainder in buf.
+        async function readExactly(n) {
+          while (buf.length < n) {
+            const {value, done} = await reader.read();
+            if (done) throw new Error('stream ended');
+            const next = new Uint8Array(buf.length + value.length);
+            next.set(buf);
+            next.set(value, buf.length);
+            buf = next;
+          }
+          const chunk = buf.slice(0, n); // slice copies, giving chunk its own buffer
+          buf = buf.slice(n);
+          return chunk;
+        }
 
-      ws.onclose = () => setTimeout(connect, 1000);
+        while (true) {
+          const lenBytes = await readExactly(4);
+          const len = new DataView(lenBytes.buffer).getUint32(0, true);
+          const msg = await readExactly(len);
+          renderQueue = renderQueue
+            .then(() => applyFrame(msg.buffer))
+            .catch(() => {});
+        }
+      } catch (_) {
+        setTimeout(connect, 1000);
+      }
     }
 
     // applyFrame parses a binary delta message, decodes all tile JPEGs in
@@ -120,7 +142,7 @@
         const h   = view.getUint16(off, true); off += 2;
         const len = view.getUint32(off, true); off += 4;
 
-        // Wrap the ArrayBuffer slice without copying — Blob holds a reference.
+        // Uint8Array view into buf — no copy; Blob holds a reference.
         const jpeg = new Uint8Array(buf, off, len);
         off += len;
 

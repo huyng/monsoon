@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/disintegration/imaging"
-	"github.com/gorilla/websocket"
 )
 
 const tileSize = 64
@@ -253,40 +252,36 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 	}()
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
+// streamHandler streams binary delta frames over a plain HTTP chunked response.
+// Each frame is prefixed with its 4-byte little-endian length so the client
+// can reassemble message boundaries from the byte stream.
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no") // disable nginx proxy buffering
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
 
 	ch := hub.subscribe()
 	defer hub.unsubscribe(ch)
 
-	// Read goroutine: drains incoming messages and detects client disconnect.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}()
-
+	var lenBuf [4]byte
 	for {
 		select {
-		case <-done:
+		case <-r.Context().Done():
 			return
 		case msg := <-ch:
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(msg)))
+			if _, err := w.Write(lenBuf[:]); err != nil {
 				return
 			}
+			if _, err := w.Write(msg); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
 	}
 }
@@ -324,7 +319,7 @@ func main() {
 
 	go func() {
 		http.HandleFunc("/", indexHandler)
-		http.HandleFunc("/ws", wsHandler)
+		http.HandleFunc("/stream", streamHandler)
 		addr := fmt.Sprintf(":%d", port)
 		log.Printf("serving on http://localhost%s", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {
