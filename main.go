@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"log"
 	"net/http"
 	"os"
@@ -11,57 +15,185 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/disintegration/imaging"
+	"github.com/gorilla/websocket"
 )
 
-// frameBuffer holds the latest JPEG frame in memory and uses a sync.Cond to
-// wake HTTP handlers the moment a new frame is ready, avoiding polling delays.
-type frameBuffer struct {
-	mu   sync.RWMutex
-	data []byte
-	cond *sync.Cond
+const tileSize = 64
+const keyframeInterval = 30 // force full frame every N frames so late clients resync
+
+// wsHub manages connected WebSocket clients and broadcasts delta frame messages.
+// Each client has a small buffered channel; frames are dropped (not queued) for
+// slow clients so the server never blocks on a single lagging connection.
+// snapshot holds the most recent keyframe so new clients can initialise their
+// canvas immediately on connect.
+type wsHub struct {
+	mu       sync.Mutex
+	clients  map[chan []byte]struct{}
+	snapshot []byte
 }
 
-func newFrameBuffer() *frameBuffer {
-	fb := &frameBuffer{}
-	fb.cond = sync.NewCond(&fb.mu)
-	return fb
+func newWsHub() *wsHub {
+	return &wsHub{clients: make(map[chan []byte]struct{})}
 }
 
-func (fb *frameBuffer) store(data []byte) {
-	fb.mu.Lock()
-	fb.data = data
-	fb.mu.Unlock()
-	fb.cond.Broadcast()
+func (h *wsHub) subscribe() chan []byte {
+	ch := make(chan []byte, 4)
+	h.mu.Lock()
+	h.clients[ch] = struct{}{}
+	snap := h.snapshot
+	h.mu.Unlock()
+	if snap != nil {
+		ch <- snap
+	}
+	return ch
 }
 
-func (fb *frameBuffer) wait() []byte {
-	fb.mu.Lock()
-	defer fb.mu.Unlock()
-	fb.cond.Wait()
-	return fb.data
+func (h *wsHub) unsubscribe(ch chan []byte) {
+	h.mu.Lock()
+	delete(h.clients, ch)
+	h.mu.Unlock()
 }
 
-var frameBuf *frameBuffer
+func (h *wsHub) broadcast(msg []byte, isKeyframe bool) {
+	h.mu.Lock()
+	if isKeyframe {
+		h.snapshot = msg
+	}
+	clients := make([]chan []byte, 0, len(h.clients))
+	for ch := range h.clients {
+		clients = append(clients, ch)
+	}
+	h.mu.Unlock()
+	for _, ch := range clients {
+		select {
+		case ch <- msg:
+		default: // drop if client can't keep up
+		}
+	}
+}
 
-// frame bundles a screenshot with the mouse position sampled at the same instant,
-// so the cursor drawn in the encoded image matches the frame content.
+// dirtyTiles returns the tileSize×tileSize rectangles within curr whose pixels
+// differ from the corresponding region in prev. If prev is nil or a different
+// size (resolution change), all tiles are returned.
+func dirtyTiles(prev, curr *image.NRGBA) []image.Rectangle {
+	b := curr.Bounds()
+	W, H := b.Dx(), b.Dy()
+	tilesX := (W + tileSize - 1) / tileSize
+	tilesY := (H + tileSize - 1) / tileSize
+
+	allTiles := func() []image.Rectangle {
+		rects := make([]image.Rectangle, 0, tilesX*tilesY)
+		for ty := range tilesY {
+			for tx := range tilesX {
+				x0, y0 := tx*tileSize, ty*tileSize
+				rects = append(rects, image.Rect(x0, y0, min(x0+tileSize, W), min(y0+tileSize, H)))
+			}
+		}
+		return rects
+	}
+
+	if prev == nil || prev.Bounds().Dx() != W || prev.Bounds().Dy() != H {
+		return allTiles()
+	}
+
+	var rects []image.Rectangle
+	for ty := range tilesY {
+		for tx := range tilesX {
+			x0, y0 := tx*tileSize, ty*tileSize
+			x1, y1 := min(x0+tileSize, W), min(y0+tileSize, H)
+			if tileChanged(prev, curr, x0, y0, x1, y1) {
+				rects = append(rects, image.Rect(x0, y0, x1, y1))
+			}
+		}
+	}
+	return rects
+}
+
+// tileChanged returns true if any RGB pixel in the given rectangle differs
+// between prev and curr. Alpha is ignored (always 255 for screen content).
+func tileChanged(prev, curr *image.NRGBA, x0, y0, x1, y1 int) bool {
+	for y := y0; y < y1; y++ {
+		off := y*curr.Stride + x0*4
+		for x := x0; x < x1; x++ {
+			if prev.Pix[off] != curr.Pix[off] ||
+				prev.Pix[off+1] != curr.Pix[off+1] ||
+				prev.Pix[off+2] != curr.Pix[off+2] {
+				return true
+			}
+			off += 4
+		}
+	}
+	return false
+}
+
+// buildDeltaMsg JPEG-encodes each dirty tile and packs them into a single
+// binary WebSocket message.
+//
+// Wire format:
+//
+//	[1]  uint8  flags       0x01 = keyframe
+//	[2]  uint16 width       canvas pixel width
+//	[2]  uint16 height      canvas pixel height
+//	[2]  uint16 num_tiles
+//	Per tile:
+//	  [2] uint16 x
+//	  [2] uint16 y
+//	  [2] uint16 w
+//	  [2] uint16 h
+//	  [4] uint32 jpeg_len
+//	  [N] JPEG bytes
+func buildDeltaMsg(tiles []image.Rectangle, img *image.NRGBA, isKeyframe bool) ([]byte, error) {
+	type tileJPEG struct {
+		r    image.Rectangle
+		data []byte
+	}
+	encoded := make([]tileJPEG, 0, len(tiles))
+	for _, r := range tiles {
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img.SubImage(r), &jpeg.Options{Quality: 80}); err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, tileJPEG{r, buf.Bytes()})
+	}
+
+	b := img.Bounds()
+	var out bytes.Buffer
+	flags := byte(0)
+	if isKeyframe {
+		flags = 0x01
+	}
+	out.WriteByte(flags)
+	binary.Write(&out, binary.LittleEndian, uint16(b.Dx()))
+	binary.Write(&out, binary.LittleEndian, uint16(b.Dy()))
+	binary.Write(&out, binary.LittleEndian, uint16(len(encoded)))
+	for _, t := range encoded {
+		binary.Write(&out, binary.LittleEndian, uint16(t.r.Min.X))
+		binary.Write(&out, binary.LittleEndian, uint16(t.r.Min.Y))
+		binary.Write(&out, binary.LittleEndian, uint16(t.r.Dx()))
+		binary.Write(&out, binary.LittleEndian, uint16(t.r.Dy()))
+		binary.Write(&out, binary.LittleEndian, uint32(len(t.data)))
+		out.Write(t.data)
+	}
+	return out.Bytes(), nil
+}
+
+// frame bundles a screenshot with the mouse position sampled at the same instant.
 type frame struct {
-	shot          *Screenshot
+	shot           *Screenshot
 	mouseX, mouseY int
 }
 
+var hub *wsHub
+
 // startCapturePipeline launches two pipelined goroutines:
 //  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
-//  2. encode goroutine: resizes and JPEG-encodes each raw frame, stores in frameBuf
+//  2. encode goroutine: resizes the frame, computes dirty tiles vs previous frame,
+//     builds a binary delta message, and broadcasts it to all WebSocket clients.
 //
-// Using a ticker (instead of time.Sleep) ensures capture fires at exact wall-clock
-// intervals regardless of how long capture takes. The channel buffer of 1 with a
-// non-blocking send means the encoder always gets the latest frame; if it's busy,
-// the frame is dropped rather than queued.
-//
-// The mouse position is sampled alongside each screenshot via XQueryPointer so the
-// drawn cursor matches the frame. Position lookup is best-effort — on failure the
-// cursor is drawn at (0,0).
+// The encode goroutine forces a full keyframe every keyframeInterval frames so
+// that late-joining or resyncing clients converge to the correct state quickly.
 func startCapturePipeline(capturer *Capturer, fps, width int) {
 	rawCh := make(chan frame, 1)
 
@@ -78,22 +210,85 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 			mx, my, _ := capturer.GetMousePos() // best-effort; (0,0) on failure
 			select {
 			case rawCh <- frame{shot, mx, my}:
-			default: // encoder busy, drop frame
+			default: // encoder busy — drop, always show latest
 			}
 		}
 	}()
 
 	// Encode goroutine
 	go func() {
+		var prevResized *image.NRGBA
+		frameCount := 0
+
 		for f := range rawCh {
-			jpeg, err := f.shot.ToJPEG(width, f.mouseX, f.mouseY)
-			if err != nil {
-				fmt.Printf("Failed to encode: %v\n", err)
+			scale := float64(width) / float64(f.shot.Width)
+			resized := imaging.Resize(f.shot.toRGBA(), width, 0, imaging.Linear)
+			drawCursorAt(resized,
+				int(float64(f.mouseX)*scale),
+				int(float64(f.mouseY)*scale),
+				cursorW)
+
+			isKeyframe := prevResized == nil || frameCount%keyframeInterval == 0
+			var dirty []image.Rectangle
+			if isKeyframe {
+				dirty = dirtyTiles(nil, resized)
+			} else {
+				dirty = dirtyTiles(prevResized, resized)
+			}
+			frameCount++
+
+			if len(dirty) == 0 {
+				prevResized = resized
 				continue
 			}
-			frameBuf.store(jpeg)
+
+			msg, err := buildDeltaMsg(dirty, resized, isKeyframe)
+			if err != nil {
+				fmt.Printf("Failed to encode delta: %v\n", err)
+				continue
+			}
+			hub.broadcast(msg, isKeyframe)
+			prevResized = resized
 		}
 	}()
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ch := hub.subscribe()
+	defer hub.unsubscribe(ch)
+
+	// Read goroutine: drains incoming messages and detects client disconnect.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		case msg := <-ch:
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+				return
+			}
+		}
+	}
 }
 
 //go:embed index.html
@@ -102,24 +297,6 @@ var indexHTML string
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(indexHTML))
-}
-
-func streamHandler(w http.ResponseWriter, r *http.Request) {
-	boundary := "frameBoundary"
-	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
-	flusher := w.(http.Flusher)
-
-	for {
-		frame := frameBuf.wait()
-
-		_, err := fmt.Fprintf(w, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", boundary, len(frame))
-		if err != nil {
-			return // client disconnected
-		}
-		w.Write(frame)
-		fmt.Fprintf(w, "\r\n")
-		flusher.Flush() // send frame to client immediately, no buffering
-	}
 }
 
 func main() {
@@ -142,13 +319,12 @@ func main() {
 	}
 	defer capturer.Close()
 
-	frameBuf = newFrameBuffer()
-
+	hub = newWsHub()
 	startCapturePipeline(capturer, fps, width)
 
 	go func() {
 		http.HandleFunc("/", indexHandler)
-		http.HandleFunc("/stream", streamHandler)
+		http.HandleFunc("/ws", wsHandler)
 		addr := fmt.Sprintf(":%d", port)
 		log.Printf("serving on http://localhost%s", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {

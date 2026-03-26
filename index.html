@@ -29,17 +29,15 @@
 
     .player {
       width: min(100%, 1280px);
-      aspect-ratio: 16/9;
       background: #000;
       border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 8px 32px rgba(0,0,0,0.6);
     }
 
-    .player img {
+    canvas {
       width: 100%;
-      height: 100%;
-      object-fit: contain;
+      height: auto;
       display: block;
     }
 
@@ -67,8 +65,78 @@
 <body>
   <h1>monsoon</h1>
   <div class="player">
-    <img src="/stream" alt="screen stream">
+    <canvas id="screen"></canvas>
   </div>
   <p class="status"><span class="dot"></span>live</p>
+
+  <script>
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d', {alpha: false});
+
+    // Chain renders so frames are always applied in order and canvas writes
+    // never race. If a frame takes longer than the interval to decode, the
+    // next frame waits rather than overlapping — newest data always wins
+    // because the server drops frames for slow clients at the source.
+    let renderQueue = Promise.resolve();
+
+    function connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onmessage = (event) => {
+        const buf = event.data;
+        renderQueue = renderQueue
+          .then(() => applyFrame(buf))
+          .catch(() => {});
+      };
+
+      ws.onclose = () => setTimeout(connect, 1000);
+    }
+
+    // applyFrame parses a binary delta message, decodes all tile JPEGs in
+    // parallel via createImageBitmap, then paints them onto the canvas.
+    async function applyFrame(buf) {
+      const view = new DataView(buf);
+      let off = 0;
+
+      // Header
+      /* flags = */ view.getUint8(off++);          // 0x01 = keyframe (informational)
+      const width    = view.getUint16(off, true); off += 2;
+      const height   = view.getUint16(off, true); off += 2;
+      const numTiles = view.getUint16(off, true); off += 2;
+
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width  = width;
+        canvas.height = height;
+      }
+
+      // Parse tile metadata and kick off parallel JPEG decodes.
+      const positions = new Array(numTiles);
+      const decodes   = new Array(numTiles);
+      for (let i = 0; i < numTiles; i++) {
+        const x   = view.getUint16(off, true); off += 2;
+        const y   = view.getUint16(off, true); off += 2;
+        const w   = view.getUint16(off, true); off += 2;
+        const h   = view.getUint16(off, true); off += 2;
+        const len = view.getUint32(off, true); off += 4;
+
+        // Wrap the ArrayBuffer slice without copying — Blob holds a reference.
+        const jpeg = new Uint8Array(buf, off, len);
+        off += len;
+
+        positions[i] = {x, y};
+        decodes[i]   = createImageBitmap(new Blob([jpeg], {type: 'image/jpeg'}));
+      }
+
+      // Decode all tiles concurrently, then paint in a single synchronous pass.
+      const bitmaps = await Promise.all(decodes);
+      for (let i = 0; i < bitmaps.length; i++) {
+        ctx.drawImage(bitmaps[i], positions[i].x, positions[i].y);
+        bitmaps[i].close();
+      }
+    }
+
+    connect();
+  </script>
 </body>
 </html>
