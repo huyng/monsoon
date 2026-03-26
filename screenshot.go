@@ -184,7 +184,7 @@ func (c *Capturer) Capture() (*Screenshot, error) {
 // using XQueryPointer — no XFixes extension required.
 func (c *Capturer) GetMousePos() (int, int, error) {
 	var x, y C.int
-	if C.get_mouse_pos(c.dpy, &x, &y) != 0 {
+	if C.get_mouse_pos(c.ctx, &x, &y) != 0 {
 		return 0, 0, fmt.Errorf("XQueryPointer failed")
 	}
 	return int(x), int(y), nil
