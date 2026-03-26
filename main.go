@@ -43,11 +43,11 @@ func (fb *frameBuffer) wait() []byte {
 
 var frameBuf *frameBuffer
 
-// frame bundles a screenshot with the cursor snapshot taken at the same instant,
-// so the cursor position in the encoded image matches the frame content.
+// frame bundles a screenshot with the mouse position sampled at the same instant,
+// so the cursor drawn in the encoded image matches the frame content.
 type frame struct {
-	shot   *Screenshot
-	cursor *CursorInfo // nil if XFixes is unavailable
+	shot          *Screenshot
+	mouseX, mouseY int
 }
 
 // startCapturePipeline launches two pipelined goroutines:
@@ -59,9 +59,9 @@ type frame struct {
 // non-blocking send means the encoder always gets the latest frame; if it's busy,
 // the frame is dropped rather than queued.
 //
-// The cursor is captured alongside each screenshot so its position is consistent
-// with the frame. XFixes cursor capture is best-effort — failures are silently
-// dropped (cursor simply won't appear that frame).
+// The mouse position is sampled alongside each screenshot via XQueryPointer so the
+// drawn cursor matches the frame. Position lookup is best-effort — on failure the
+// cursor is drawn at (0,0).
 func startCapturePipeline(capturer *Capturer, fps, width int) {
 	rawCh := make(chan frame, 1)
 
@@ -75,9 +75,9 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 				fmt.Printf("Failed to capture: %v\n", err)
 				continue
 			}
-			cursor, _ := capturer.GetCursor() // best-effort; nil on failure
+			mx, my, _ := capturer.GetMousePos() // best-effort; (0,0) on failure
 			select {
-			case rawCh <- frame{shot, cursor}:
+			case rawCh <- frame{shot, mx, my}:
 			default: // encoder busy, drop frame
 			}
 		}
@@ -86,7 +86,7 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 	// Encode goroutine
 	go func() {
 		for f := range rawCh {
-			jpeg, err := f.shot.ToJPEG(width, f.cursor)
+			jpeg, err := f.shot.ToJPEG(width, f.mouseX, f.mouseY)
 			if err != nil {
 				fmt.Printf("Failed to encode: %v\n", err)
 				continue
