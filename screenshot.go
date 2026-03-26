@@ -102,8 +102,6 @@ uint8_t* capture_screenshot(CaptureCtx* c, int* out_width, int* out_height) {
     if (data) memcpy(data, c->img->data, size);
     return data;
 }
-<<<<<<< Updated upstream
-=======
 
 // get_mouse_pos returns the current pointer position relative to the root window.
 // Returns 0 on success.
@@ -116,13 +114,14 @@ int get_mouse_pos(CaptureCtx* c, int* x, int* y) {
                             x, y, &win_x, &win_y, &mask);
     return ok ? 0 : -1;
 }
->>>>>>> Stashed changes
+
 */
 import "C"
 import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"unsafe"
 
@@ -181,13 +180,11 @@ func (c *Capturer) Capture() (*Screenshot, error) {
 	}, nil
 }
 
-<<<<<<< Updated upstream
-=======
 // GetMousePos returns the current pointer position on the root window
 // using XQueryPointer — no XFixes extension required.
 func (c *Capturer) GetMousePos() (int, int, error) {
 	var x, y C.int
-	if C.get_mouse_pos(c.ctx, &x, &y) != 0 {
+	if C.get_mouse_pos(c.dpy, &x, &y) != 0 {
 		return 0, 0, fmt.Errorf("XQueryPointer failed")
 	}
 	return int(x), int(y), nil
@@ -240,17 +237,18 @@ func drawCursorAt(img *image.RGBA, x, y int) {
 	}
 }
 
->>>>>>> Stashed changes
 // ToImage converts the raw BGRX pixel data to an image.RGBA,
-// swapping the B and R channels to match Go's RGBA layout.
-func (s *Screenshot) ToImage() *image.RGBA {
+// swapping the B and R channels to match Go's RGBA layout,
+// then draws the cursor at the given screen position.
+func (s *Screenshot) ToImage(mouseX, mouseY int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, s.Width, s.Height))
 	for i := 0; i < s.Width*s.Height; i++ {
 		img.Pix[i*4+0] = s.Data[i*4+2] // R
 		img.Pix[i*4+1] = s.Data[i*4+1] // G
 		img.Pix[i*4+2] = s.Data[i*4+0] // B
-		img.Pix[i*4+3] = 255            // A
+		img.Pix[i*4+3] = 255           // A
 	}
+	drawCursorAt(img, mouseX, mouseY)
 	return img
 }
 
@@ -259,8 +257,9 @@ func (s *Screenshot) ToImage() *image.RGBA {
 // imaging.Linear is used instead of Lanczos — fast enough for screen content
 // with no visible quality difference for text/UI.
 // Quality 65 balances sharpness and bandwidth for screen sharing.
-func (s *Screenshot) ToJPEG(width int) ([]byte, error) {
-	resized := imaging.Resize(s.ToImage(), width, 0, imaging.Linear)
+// The cursor is drawn before resize so it scales correctly with the output.
+func (s *Screenshot) ToJPEG(width, mouseX, mouseY int) ([]byte, error) {
+	resized := imaging.Resize(s.ToImage(mouseX, mouseY), width, 0, imaging.Linear)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 65}); err != nil {

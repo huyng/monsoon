@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"flag"
 	"fmt"
 	"log"
@@ -42,6 +43,13 @@ func (fb *frameBuffer) wait() []byte {
 
 var frameBuf *frameBuffer
 
+// frame bundles a screenshot with the mouse position sampled at the same instant,
+// so the cursor drawn in the encoded image matches the frame content.
+type frame struct {
+	shot          *Screenshot
+	mouseX, mouseY int
+}
+
 // startCapturePipeline launches two pipelined goroutines:
 //  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
 //  2. encode goroutine: resizes and JPEG-encodes each raw frame, stores in frameBuf
@@ -50,8 +58,12 @@ var frameBuf *frameBuffer
 // intervals regardless of how long capture takes. The channel buffer of 1 with a
 // non-blocking send means the encoder always gets the latest frame; if it's busy,
 // the frame is dropped rather than queued.
+//
+// The mouse position is sampled alongside each screenshot via XQueryPointer so the
+// drawn cursor matches the frame. Position lookup is best-effort — on failure the
+// cursor is drawn at (0,0).
 func startCapturePipeline(capturer *Capturer, fps, width int) {
-	rawCh := make(chan *Screenshot, 1)
+	rawCh := make(chan frame, 1)
 
 	// Capture goroutine
 	go func() {
@@ -63,8 +75,9 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 				fmt.Printf("Failed to capture: %v\n", err)
 				continue
 			}
+			mx, my, _ := capturer.GetMousePos() // best-effort; (0,0) on failure
 			select {
-			case rawCh <- shot:
+			case rawCh <- frame{shot, mx, my}:
 			default: // encoder busy, drop frame
 			}
 		}
@@ -72,8 +85,8 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 
 	// Encode goroutine
 	go func() {
-		for shot := range rawCh {
-			jpeg, err := shot.ToJPEG(width)
+		for f := range rawCh {
+			jpeg, err := f.shot.ToJPEG(width, f.mouseX, f.mouseY)
 			if err != nil {
 				fmt.Printf("Failed to encode: %v\n", err)
 				continue
@@ -83,80 +96,8 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 	}()
 }
 
-const indexHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>monsoon</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      background: #0f0f0f;
-      color: #e0e0e0;
-      font-family: system-ui, sans-serif;
-      height: 100dvh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 16px;
-    }
-
-    h1 {
-      font-size: 0.85rem;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: #666;
-    }
-
-    .player {
-      width: min(100%, 1280px);
-      aspect-ratio: 16/9;
-      background: #000;
-      border-radius: 8px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-    }
-
-    .player img {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      display: block;
-    }
-
-    .status {
-      font-size: 0.75rem;
-      color: #444;
-    }
-
-    .dot {
-      display: inline-block;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: #e53;
-      margin-right: 6px;
-      animation: pulse 1.5s ease-in-out infinite;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50%       { opacity: 0.3; }
-    }
-  </style>
-</head>
-<body>
-  <h1>monsoon</h1>
-  <div class="player">
-    <img src="/stream" alt="screen stream">
-  </div>
-  <p class="status"><span class="dot"></span>live</p>
-</body>
-</html>`
+//go:embed index.html
+var indexHTML string
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
