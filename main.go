@@ -65,6 +65,7 @@ func captureFrames(display string, intervalMSecs int, width int) {
 func streamHandler(w http.ResponseWriter, r *http.Request) {
 	boundary := "frameBoundary"
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
+	flusher := w.(http.Flusher)
 
 	for {
 		frame := frameBuf.wait()
@@ -75,6 +76,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Write(frame)
 		fmt.Fprintf(w, "\r\n")
+		flusher.Flush() // send frame to client immediately, no buffering
 	}
 }
 
@@ -86,7 +88,7 @@ func main() {
 	flag.StringVar(&display, "d", ":0.0", "X display to capture")
 	flag.IntVar(&port, "p", 8080, "HTTP port")
 	flag.IntVar(&width, "w", 1280, "Output width in pixels (height scaled proportionally)")
-	flag.IntVar(&fps, "r", 30, "Capture frame rate")
+	flag.IntVar(&fps, "r", 10, "Capture frame rate")
 	flag.Parse()
 
 	fmt.Printf("Capturing DISPLAY=%s\n", display)
