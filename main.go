@@ -294,9 +294,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 //go:embed index.html
 var indexHTML string
 
+//go:embed client.js
+var clientJS string
+
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(indexHTML))
+}
+
+func clientJSHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript")
+	w.Write([]byte(clientJS))
 }
 
 func main() {
@@ -324,6 +332,7 @@ func main() {
 
 	go func() {
 		http.HandleFunc("/", indexHandler)
+		http.HandleFunc("/client.js", clientJSHandler)
 		http.HandleFunc("/stream", streamHandler)
 		addr := fmt.Sprintf(":%d", port)
 		log.Printf("serving on http://localhost%s", addr)
