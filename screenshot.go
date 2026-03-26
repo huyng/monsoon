@@ -62,27 +62,41 @@ type Screenshot struct {
 	Data   []byte // BGRX: 4 bytes/pixel, row-major
 }
 
-// Capture takes a screenshot from the given X display (e.g. ":0.0").
-func Capture(display string) (*Screenshot, error) {
+// Capturer holds a persistent X display connection.
+// Reusing the connection across frames avoids the overhead of XOpenDisplay
+// and XCloseDisplay on every capture (~5-10ms per call).
+type Capturer struct {
+	dpy *C.Display
+}
+
+// NewCapturer opens a connection to the given X display and returns a Capturer.
+// Call Close() when done.
+func NewCapturer(display string) (*Capturer, error) {
 	cDisplay := C.CString(display)
 	defer C.free(unsafe.Pointer(cDisplay))
-
 	dpy := C.XOpenDisplay(cDisplay)
 	if dpy == nil {
 		return nil, fmt.Errorf("cannot open display %q", display)
 	}
-	defer C.XCloseDisplay(dpy)
+	return &Capturer{dpy: dpy}, nil
+}
 
+// Close releases the X display connection.
+func (c *Capturer) Close() {
+	C.XCloseDisplay(c.dpy)
+}
+
+// Capture takes a screenshot using the persistent display connection.
+func (c *Capturer) Capture() (*Screenshot, error) {
 	var width, height C.int
-	data := C.capture_screenshot(dpy, &width, &height)
+	data := C.capture_screenshot(c.dpy, &width, &height)
 	if data == nil {
 		return nil, fmt.Errorf("capture_screenshot failed")
 	}
 	defer C.free(unsafe.Pointer(data))
 
 	size := int(width) * int(height) * 4 // BGRX: 4 bytes/pixel
-	buf := make([]byte, size)
-	copy(buf, C.GoBytes(unsafe.Pointer(data), C.int(size)))
+	buf := C.GoBytes(unsafe.Pointer(data), C.int(size))
 
 	return &Screenshot{
 		Width:  int(width),

@@ -42,24 +42,45 @@ func (fb *frameBuffer) wait() []byte {
 
 var frameBuf *frameBuffer
 
-func captureFrames(display string, intervalMSecs int, width int) {
-	for {
-		screenshot, err := Capture(display)
-		if err != nil {
-			fmt.Printf("Failed to capture: %v\n", err)
-			continue
+// startCapturePipeline launches two pipelined goroutines:
+//  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
+//  2. encode goroutine: resizes and JPEG-encodes each raw frame, stores in frameBuf
+//
+// Using a ticker (instead of time.Sleep) ensures capture fires at exact wall-clock
+// intervals regardless of how long capture takes. The channel buffer of 1 with a
+// non-blocking send means the encoder always gets the latest frame; if it's busy,
+// the frame is dropped rather than queued.
+func startCapturePipeline(capturer *Capturer, fps, width int) {
+	rawCh := make(chan *Screenshot, 1)
+
+	// Capture goroutine
+	go func() {
+		ticker := time.NewTicker(time.Second / time.Duration(fps))
+		defer ticker.Stop()
+		for range ticker.C {
+			shot, err := capturer.Capture()
+			if err != nil {
+				fmt.Printf("Failed to capture: %v\n", err)
+				continue
+			}
+			select {
+			case rawCh <- shot:
+			default: // encoder busy, drop frame
+			}
 		}
+	}()
 
-		jpeg, err := screenshot.ToJPEG(width)
-		if err != nil {
-			fmt.Printf("Failed to encode: %v\n", err)
-			continue
+	// Encode goroutine
+	go func() {
+		for shot := range rawCh {
+			jpeg, err := shot.ToJPEG(width)
+			if err != nil {
+				fmt.Printf("Failed to encode: %v\n", err)
+				continue
+			}
+			frameBuf.store(jpeg)
 		}
-
-		frameBuf.store(jpeg)
-
-		time.Sleep(time.Millisecond * time.Duration(intervalMSecs))
-	}
+	}()
 }
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
@@ -94,9 +115,15 @@ func main() {
 	fmt.Printf("Capturing DISPLAY=%s\n", display)
 	os.Setenv("DISPLAY", display)
 
+	capturer, err := NewCapturer(display)
+	if err != nil {
+		log.Fatalf("failed to open display: %v", err)
+	}
+	defer capturer.Close()
+
 	frameBuf = newFrameBuffer()
 
-	go captureFrames(display, 1000/fps, width)
+	startCapturePipeline(capturer, fps, width)
 
 	go func() {
 		http.HandleFunc("/stream", streamHandler)
