@@ -43,6 +43,13 @@ func (fb *frameBuffer) wait() []byte {
 
 var frameBuf *frameBuffer
 
+// frame bundles a screenshot with the cursor snapshot taken at the same instant,
+// so the cursor position in the encoded image matches the frame content.
+type frame struct {
+	shot   *Screenshot
+	cursor *CursorInfo // nil if XFixes is unavailable
+}
+
 // startCapturePipeline launches two pipelined goroutines:
 //  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
 //  2. encode goroutine: resizes and JPEG-encodes each raw frame, stores in frameBuf
@@ -51,8 +58,12 @@ var frameBuf *frameBuffer
 // intervals regardless of how long capture takes. The channel buffer of 1 with a
 // non-blocking send means the encoder always gets the latest frame; if it's busy,
 // the frame is dropped rather than queued.
+//
+// The cursor is captured alongside each screenshot so its position is consistent
+// with the frame. XFixes cursor capture is best-effort — failures are silently
+// dropped (cursor simply won't appear that frame).
 func startCapturePipeline(capturer *Capturer, fps, width int) {
-	rawCh := make(chan *Screenshot, 1)
+	rawCh := make(chan frame, 1)
 
 	// Capture goroutine
 	go func() {
@@ -64,8 +75,9 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 				fmt.Printf("Failed to capture: %v\n", err)
 				continue
 			}
+			cursor, _ := capturer.GetCursor() // best-effort; nil on failure
 			select {
-			case rawCh <- shot:
+			case rawCh <- frame{shot, cursor}:
 			default: // encoder busy, drop frame
 			}
 		}
@@ -73,8 +85,8 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 
 	// Encode goroutine
 	go func() {
-		for shot := range rawCh {
-			jpeg, err := shot.ToJPEG(width)
+		for f := range rawCh {
+			jpeg, err := f.shot.ToJPEG(width, f.cursor)
 			if err != nil {
 				fmt.Printf("Failed to encode: %v\n", err)
 				continue
