@@ -22,54 +22,42 @@ import (
 const tileSize = 64
 const keyframeInterval = 30 // force full frame every N frames so late clients resync
 
-// streamHub manages connected HTTP streaming clients and broadcasts delta frame messages.
-// Each client has a small buffered channel; frames are dropped (not queued) for
-// slow clients so the server never blocks on a single lagging connection.
-// snapshot holds the most recent keyframe so new clients can initialise their
-// canvas immediately on connect.
-type streamHub struct {
+// frameBuffer holds the latest delta message and the most recent keyframe.
+// Handlers block on Wait; the encode goroutine calls Broadcast after each store.
+// Slow clients naturally skip frames: if a handler is busy writing, it misses
+// the Broadcast and picks up the next message on its next Wait call.
+type frameBuffer struct {
 	mu       sync.Mutex
-	clients  map[chan []byte]struct{}
-	snapshot []byte
+	msg      []byte
+	snapshot []byte // last keyframe, sent to new clients on connect
+	cond     *sync.Cond
 }
 
-func newStreamHub() *streamHub {
-	return &streamHub{clients: make(map[chan []byte]struct{})}
+func newFrameBuffer() *frameBuffer {
+	fb := &frameBuffer{}
+	fb.cond = sync.NewCond(&fb.mu)
+	return fb
 }
 
-func (h *streamHub) subscribe() chan []byte {
-	ch := make(chan []byte, 4)
-	h.mu.Lock()
-	h.clients[ch] = struct{}{}
-	snap := h.snapshot
-	h.mu.Unlock()
-	if snap != nil {
-		ch <- snap
-	}
-	return ch
-}
-
-func (h *streamHub) unsubscribe(ch chan []byte) {
-	h.mu.Lock()
-	delete(h.clients, ch)
-	h.mu.Unlock()
-}
-
-func (h *streamHub) broadcast(msg []byte, isKeyframe bool) {
-	h.mu.Lock()
+func (fb *frameBuffer) store(msg []byte, isKeyframe bool) {
+	fb.mu.Lock()
+	fb.msg = msg
 	if isKeyframe {
-		h.snapshot = msg
+		fb.snapshot = msg
 	}
-	clients := make([]chan []byte, 0, len(h.clients))
-	for ch := range h.clients {
-		clients = append(clients, ch)
-	}
-	h.mu.Unlock()
-	for _, ch := range clients {
-		select {
-		case ch <- msg:
-		default: // drop if client can't keep up
-		}
+	fb.mu.Unlock()
+	fb.cond.Broadcast()
+}
+
+func (fb *frameBuffer) waitNext(done <-chan struct{}) ([]byte, bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.cond.Wait()
+	select {
+	case <-done:
+		return nil, false
+	default:
+		return fb.msg, true
 	}
 }
 
@@ -184,7 +172,7 @@ type frame struct {
 	mouseX, mouseY int
 }
 
-var hub *streamHub
+var frameBuf *frameBuffer
 
 // startCapturePipeline launches two pipelined goroutines:
 //  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
@@ -246,7 +234,7 @@ func startCapturePipeline(capturer *Capturer, fps, width int) {
 				fmt.Printf("Failed to encode delta: %v\n", err)
 				continue
 			}
-			hub.broadcast(msg, isKeyframe)
+			frameBuf.store(msg, isKeyframe)
 			prevResized = resized
 		}
 	}()
@@ -265,23 +253,40 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch := hub.subscribe()
-	defer hub.unsubscribe(ch)
-
 	var lenBuf [4]byte
+	send := func(msg []byte) bool {
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(msg)))
+		if _, err := w.Write(lenBuf[:]); err != nil {
+			return false
+		}
+		if _, err := w.Write(msg); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	// Send the latest keyframe so the client can initialise its canvas immediately.
+	frameBuf.mu.Lock()
+	snap := frameBuf.snapshot
+	frameBuf.mu.Unlock()
+	if snap != nil && !send(snap) {
+		return
+	}
+
+	// Wake this handler if the client disconnects while blocked in waitNext.
+	go func() {
+		<-r.Context().Done()
+		frameBuf.cond.Broadcast()
+	}()
+
 	for {
-		select {
-		case <-r.Context().Done():
+		msg, ok := frameBuf.waitNext(r.Context().Done())
+		if !ok {
 			return
-		case msg := <-ch:
-			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(msg)))
-			if _, err := w.Write(lenBuf[:]); err != nil {
-				return
-			}
-			if _, err := w.Write(msg); err != nil {
-				return
-			}
-			flusher.Flush()
+		}
+		if !send(msg) {
+			return
 		}
 	}
 }
@@ -314,7 +319,7 @@ func main() {
 	}
 	defer capturer.Close()
 
-	hub = newStreamHub()
+	frameBuf = newFrameBuffer()
 	startCapturePipeline(capturer, fps, width)
 
 	go func() {
