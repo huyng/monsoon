@@ -1,22 +1,15 @@
-# monsoon
+# Monsoon
 
 A lightweight screen sharing server for Linux. Point a browser at it and watch
 the desktop live — no plugins, no accounts, no WebRTC negotiation, no external
 services.
 
-## Why monsoon?
+## Why Monsoon?
 
 Most screen sharing tools are built around accounts, installers, proprietary
 clients, or cloud infrastructure that your traffic has to pass through. Monsoon
 runs entirely on your machine. It is a single self-contained binary that any
 browser on your network can connect to immediately.
-
-Under the hood it uses X11 MIT-SHM to capture frames with zero pixel copies,
-then diffs each frame against the previous one at the tile level and ships only
-what changed. Tiles are JPEG-encoded and packed into a compact binary stream
-delivered over plain HTTP chunked transfer — no WebSocket, no plugin, just
-`fetch()` and a `<canvas>`. At 10 fps a mostly-static desktop typically
-transfers less than 50 KB/s.
 
 Good for:
 - Sharing your screen with someone on your local network instantly
