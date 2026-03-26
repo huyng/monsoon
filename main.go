@@ -22,22 +22,22 @@ import (
 const tileSize = 64
 const keyframeInterval = 30 // force full frame every N frames so late clients resync
 
-// wsHub manages connected WebSocket clients and broadcasts delta frame messages.
+// streamHub manages connected HTTP streaming clients and broadcasts delta frame messages.
 // Each client has a small buffered channel; frames are dropped (not queued) for
 // slow clients so the server never blocks on a single lagging connection.
 // snapshot holds the most recent keyframe so new clients can initialise their
 // canvas immediately on connect.
-type wsHub struct {
+type streamHub struct {
 	mu       sync.Mutex
 	clients  map[chan []byte]struct{}
 	snapshot []byte
 }
 
-func newWsHub() *wsHub {
-	return &wsHub{clients: make(map[chan []byte]struct{})}
+func newStreamHub() *streamHub {
+	return &streamHub{clients: make(map[chan []byte]struct{})}
 }
 
-func (h *wsHub) subscribe() chan []byte {
+func (h *streamHub) subscribe() chan []byte {
 	ch := make(chan []byte, 4)
 	h.mu.Lock()
 	h.clients[ch] = struct{}{}
@@ -49,13 +49,13 @@ func (h *wsHub) subscribe() chan []byte {
 	return ch
 }
 
-func (h *wsHub) unsubscribe(ch chan []byte) {
+func (h *streamHub) unsubscribe(ch chan []byte) {
 	h.mu.Lock()
 	delete(h.clients, ch)
 	h.mu.Unlock()
 }
 
-func (h *wsHub) broadcast(msg []byte, isKeyframe bool) {
+func (h *streamHub) broadcast(msg []byte, isKeyframe bool) {
 	h.mu.Lock()
 	if isKeyframe {
 		h.snapshot = msg
@@ -128,7 +128,7 @@ func tileChanged(prev, curr *image.NRGBA, x0, y0, x1, y1 int) bool {
 }
 
 // buildDeltaMsg JPEG-encodes each dirty tile and packs them into a single
-// binary WebSocket message.
+// binary frame for streaming to clients.
 //
 // Wire format:
 //
@@ -184,12 +184,12 @@ type frame struct {
 	mouseX, mouseY int
 }
 
-var hub *wsHub
+var hub *streamHub
 
 // startCapturePipeline launches two pipelined goroutines:
 //  1. capture goroutine: fires at target FPS via ticker, sends raw frames to rawCh
 //  2. encode goroutine: resizes the frame, computes dirty tiles vs previous frame,
-//     builds a binary delta message, and broadcasts it to all WebSocket clients.
+//     builds a binary delta message, and broadcasts it to all streaming clients.
 //
 // The encode goroutine forces a full keyframe every keyframeInterval frames so
 // that late-joining or resyncing clients converge to the correct state quickly.
@@ -314,7 +314,7 @@ func main() {
 	}
 	defer capturer.Close()
 
-	hub = newWsHub()
+	hub = newStreamHub()
 	startCapturePipeline(capturer, fps, width)
 
 	go func() {
