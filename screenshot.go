@@ -128,21 +128,27 @@ func (c *Capturer) GetMousePos() (int, int, error) {
 	return int(x), int(y), nil
 }
 
-// cursorPixels is a 10×10 hardcoded arrow-head cursor pointing upper-left.
-// Values: 0 = transparent, 1 = white fill, 2 = black outline. Hotspot at (0,0).
-const cursorW, cursorH = 10, 10
+// cursorPixels is a 16×16 hardcoded arrow-head cursor pointing upper-left.
+// Values: 0 = transparent, 1 = bright yellow fill, 2 = black outline. Hotspot at (0,0).
+const cursorW, cursorH = 16, 16
 
 var cursorPixels = [cursorH][cursorW]byte{
-	{2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-	{2, 2, 0, 0, 0, 0, 0, 0, 0, 0},
-	{2, 1, 2, 0, 0, 0, 0, 0, 0, 0},
-	{2, 1, 1, 2, 0, 0, 0, 0, 0, 0},
-	{2, 1, 1, 1, 2, 0, 0, 0, 0, 0},
-	{2, 1, 1, 1, 1, 2, 0, 0, 0, 0},
-	{2, 1, 1, 1, 1, 1, 2, 0, 0, 0},
-	{2, 1, 1, 1, 1, 1, 1, 2, 0, 0},
-	{2, 1, 1, 1, 1, 1, 1, 1, 2, 0},
-	{2, 2, 2, 2, 2, 2, 2, 2, 2, 0},
+	{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0},
+	{2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0},
+	{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0},
 }
 
 // drawCursorAt paints the hardcoded arrow cursor onto img with its tip at (x, y).
@@ -161,9 +167,9 @@ func drawCursorAt(img *image.RGBA, x, y int) {
 				continue
 			}
 			if v == 1 {
-				img.SetRGBA(sx, sy, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+				img.SetRGBA(sx, sy, color.RGBA{R: 255, G: 255, B: 0, A: 255}) // bright yellow
 			} else {
-				img.SetRGBA(sx, sy, color.RGBA{R: 0, G: 0, B: 0, A: 255})
+				img.SetRGBA(sx, sy, color.RGBA{R: 0, G: 0, B: 0, A: 255}) // black outline
 			}
 		}
 	}
