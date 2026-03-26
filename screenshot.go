@@ -122,6 +122,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"unsafe"
 
@@ -214,8 +215,10 @@ var cursorPixels = [cursorH][cursorW]byte{
 }
 
 // drawCursorAt paints the hardcoded arrow cursor onto img with its tip at (x, y).
-// Pixels that fall outside the image bounds are clipped.
-func drawCursorAt(img *image.RGBA, x, y int) {
+// size controls the rendered width/height in pixels; the 16×16 template is scaled
+// to fit. Pixels outside the image bounds are clipped.
+func drawCursorAt(img draw.Image, x, y, size int) {
+	scale := float64(size) / float64(cursorW)
 	bounds := img.Bounds()
 	for py := 0; py < cursorH; py++ {
 		for px := 0; px < cursorW; px++ {
@@ -223,24 +226,38 @@ func drawCursorAt(img *image.RGBA, x, y int) {
 			if v == 0 {
 				continue
 			}
-			sx, sy := x+px, y+py
-			if sx < bounds.Min.X || sx >= bounds.Max.X ||
-				sy < bounds.Min.Y || sy >= bounds.Max.Y {
-				continue
+			x0 := int(float64(px) * scale)
+			y0 := int(float64(py) * scale)
+			x1 := int(float64(px+1) * scale)
+			y1 := int(float64(py+1) * scale)
+			if x1 == x0 {
+				x1 = x0 + 1
 			}
+			if y1 == y0 {
+				y1 = y0 + 1
+			}
+			var c color.Color
 			if v == 1 {
-				img.SetRGBA(sx, sy, color.RGBA{R: 255, G: 255, B: 0, A: 255}) // bright yellow
+				c = color.RGBA{R: 255, G: 255, B: 0, A: 255} // bright yellow
 			} else {
-				img.SetRGBA(sx, sy, color.RGBA{R: 0, G: 0, B: 0, A: 255}) // black outline
+				c = color.RGBA{R: 0, G: 0, B: 0, A: 255} // black outline
+			}
+			for dy := y0; dy < y1; dy++ {
+				for dx := x0; dx < x1; dx++ {
+					sx, sy := x+dx, y+dy
+					if sx < bounds.Min.X || sx >= bounds.Max.X ||
+						sy < bounds.Min.Y || sy >= bounds.Max.Y {
+						continue
+					}
+					img.Set(sx, sy, c)
+				}
 			}
 		}
 	}
 }
 
-// ToImage converts the raw BGRX pixel data to an image.RGBA,
-// swapping the B and R channels to match Go's RGBA layout,
-// then draws the cursor at the given screen position.
-func (s *Screenshot) ToImage(mouseX, mouseY int) *image.RGBA {
+// toRGBA converts raw BGRX pixel data to *image.RGBA, swapping B and R channels.
+func (s *Screenshot) toRGBA() *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, s.Width, s.Height))
 	for i := 0; i < s.Width*s.Height; i++ {
 		img.Pix[i*4+0] = s.Data[i*4+2] // R
@@ -248,7 +265,14 @@ func (s *Screenshot) ToImage(mouseX, mouseY int) *image.RGBA {
 		img.Pix[i*4+2] = s.Data[i*4+0] // B
 		img.Pix[i*4+3] = 255           // A
 	}
-	drawCursorAt(img, mouseX, mouseY)
+	return img
+}
+
+// ToImage converts the raw BGRX pixel data to an image.RGBA and draws the
+// cursor at the given screen position.
+func (s *Screenshot) ToImage(mouseX, mouseY int) *image.RGBA {
+	img := s.toRGBA()
+	drawCursorAt(img, mouseX, mouseY, cursorW)
 	return img
 }
 
@@ -257,9 +281,13 @@ func (s *Screenshot) ToImage(mouseX, mouseY int) *image.RGBA {
 // imaging.Linear is used instead of Lanczos — fast enough for screen content
 // with no visible quality difference for text/UI.
 // Quality 65 balances sharpness and bandwidth for screen sharing.
-// The cursor is drawn before resize so it scales correctly with the output.
+// The cursor is drawn after resize at scaled coordinates so it remains a
+// fixed 16×16 pixels regardless of the capture resolution.
 func (s *Screenshot) ToJPEG(width, mouseX, mouseY int) ([]byte, error) {
-	resized := imaging.Resize(s.ToImage(mouseX, mouseY), width, 0, imaging.Linear)
+	resized := imaging.Resize(s.toRGBA(), width, 0, imaging.Linear)
+
+	scale := float64(width) / float64(s.Width)
+	drawCursorAt(resized, int(float64(mouseX)*scale), int(float64(mouseY)*scale), cursorW)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 65}); err != nil {
