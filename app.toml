@@ -1,1 +1,2 @@
 id = "huyng.monsoon"
+entrypoint = "hello.py"
