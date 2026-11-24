@@ -98,6 +98,7 @@ func dirtyTiles(prev, curr *image.NRGBA) []image.Rectangle {
 	return rects
 }
 
+
 // tileChanged returns true if any RGB pixel in the given rectangle differs
 // between prev and curr. Alpha is ignored (always 255 for screen content).
 func tileChanged(prev, curr *image.NRGBA, x0, y0, x1, y1 int) bool {
